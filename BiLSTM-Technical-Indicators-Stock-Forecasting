@@ -1,0 +1,167 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Bidirectional, Input
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+
+class StockPricePredictorWithFeatures:
+    def __init__(self, ticker, start_date, end_date=None, lookback=60):
+        self.ticker = ticker
+        self.start_date = start_date
+        self.end_date = end_date if end_date else datetime.today().strftime('%Y-%m-%d')
+        self.lookback = lookback
+        self.data = None
+        self.scaler = None
+        self.model = None
+
+    def fetch_data(self):
+        """Fetch historical stock data and create technical indicators"""
+        data = yf.download(self.ticker, start=self.start_date, end=self.end_date, progress=False)
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(1)
+
+        print("Columns after fix:", data.columns.tolist())
+
+        if 'Adj Close' not in data.columns:
+            print("WARNING: 'Adj Close' not found, using 'Close'")
+            data['Adj Close'] = data['Close']
+
+        # Technical indicators
+        data['SMA_20'] = data['Adj Close'].rolling(window=20).mean()
+        data['EMA_20'] = data['Adj Close'].ewm(span=20, adjust=False).mean()
+        data['RSI'] = self.calculate_rsi(data['Adj Close'])
+
+        rolling_std = data['Adj Close'].rolling(window=20).std()
+        data['Bollinger_Upper'] = data['SMA_20'] + 2 * rolling_std
+        data['Bollinger_Lower'] = data['SMA_20'] - 2 * rolling_std
+
+        data['Spread'] = data['High'] - data['Low']
+        data['Momentum'] = data['Adj Close'] - data['Adj Close'].shift(10)
+        data['Volatility'] = rolling_std
+        data['OBV'] = self.calculate_obv(data['Adj Close'], data['Volume'])
+        data['Day_of_Week'] = data.index.dayofweek
+        data['Month'] = data.index.month
+
+        self.data = data.dropna()
+        print(f"Data ready ({len(self.data)} rows):\n{self.data.head()}")
+
+    def calculate_rsi(self, series, period=14):
+        """Calculate Relative Strength Index (RSI)"""
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def calculate_obv(self, close, volume):
+        """Calculate On-Balance Volume (OBV)"""
+        obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+        return obv
+
+    def prepare_data(self):
+        """Prepare training and testing datasets with lookback window"""
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = self.scaler.fit_transform(self.data)
+        X, y = [], []
+        for i in range(self.lookback, len(scaled_data)):
+            X.append(scaled_data[i - self.lookback:i, :])
+            y.append(scaled_data[i, 0])  # Normalized Adj Close
+        X, y = np.array(X), np.array(y)
+        train_size = int(len(X) * 0.8)
+        self.X_train, self.X_test = X[:train_size], X[train_size:]
+        self.y_train, self.y_test = y[:train_size], y[train_size:]
+        print(f"Data prepared: Train {len(self.X_train)}, Test {len(self.X_test)}")
+
+    def build_model(self):
+        """Build bidirectional LSTM model"""
+        self.model = Sequential([
+            Input(shape=(self.X_train.shape[1], self.X_train.shape[2])),
+            Bidirectional(LSTM(50, return_sequences=True)),
+            Bidirectional(LSTM(50)),
+            Dense(1)
+        ])
+        self.model.compile(optimizer='adam', loss='mean_squared_error')
+        print("Bidirectional LSTM model built.")
+
+    def train_model(self, epochs=20, batch_size=32):
+        """Train the LSTM model"""
+        history = self.model.fit(
+            self.X_train, self.y_train,
+            epochs=epochs, batch_size=batch_size,
+            validation_data=(self.X_test, self.y_test),
+            verbose=1
+        )
+        print("Model trained successfully!")
+        return history
+
+    def evaluate_model(self, next_price=None):
+        """Plot real vs predicted prices and show next price prediction"""
+        predictions = self.model.predict(self.X_test, verbose=0)
+
+        pred_full = np.hstack([predictions, np.zeros((len(predictions), self.X_test.shape[2] - 1))])
+        true_full = np.hstack([self.y_test.reshape(-1, 1), np.zeros((len(self.y_test), self.X_test.shape[2] - 1))])
+
+        predictions = self.scaler.inverse_transform(pred_full)[:, 0]
+        true_prices = self.scaler.inverse_transform(true_full)[:, 0]
+
+        test_dates = self.data.index[self.lookback + len(self.X_train):]
+
+        plt.figure(figsize=(14, 8))
+        plt.plot(test_dates, true_prices, 'b-', label='Real Prices', linewidth=2)
+        plt.plot(test_dates, predictions, 'r--', label='Predicted Prices', linewidth=2)
+        plt.title(f'{self.ticker}: Real vs Predicted Prices (Bidirectional LSTM)', fontsize=16)
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Price ($)', fontsize=12)
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+
+        # Add next price prediction to the plot
+        if next_price is not None:
+            plt.text(0.98, 0.98, f'Next Price Prediction:\n{next_price:.2f} $',
+                     transform=plt.gca().transAxes, fontsize=12, color='green',
+                     horizontalalignment='right', verticalalignment='top',
+                     bbox=dict(facecolor='white', alpha=0.8, edgecolor='green', boxstyle='round,pad=0.3'))
+
+        plt.tight_layout()
+        plt.show()
+
+    def predict_next(self):
+        """Predict the next price (t+1) based on the last historical data"""
+        last_window = self.data.values[-self.lookback:]
+        last_window_scaled = self.scaler.transform(last_window)
+        X_input = np.expand_dims(last_window_scaled, axis=0)
+        next_scaled = self.model.predict(X_input, verbose=0)[0, 0]
+
+        full = np.hstack([[next_scaled], np.zeros(self.data.shape[1] - 1)])
+        next_price = self.scaler.inverse_transform(full.reshape(1, -1))[0, 0]
+        return next_price
+
+
+if __name__ == "__main__":
+    ticker = input("Enter ticker (e.g. NVDA, TSLA, AAPL): ").strip().upper()
+
+    try:
+        epochs = int(input("Number of epochs (default 20): ").strip() or 20)
+    except ValueError:
+        epochs = 20
+        print("Using 20 epochs.")
+
+    print(f"\n🚀 Starting prediction for {ticker} from {datetime.today().strftime('%Y-%m-%d')}")
+
+    predictor = StockPricePredictorWithFeatures(ticker=ticker, start_date="2015-01-01")
+    predictor.fetch_data()
+    predictor.prepare_data()
+    predictor.build_model()
+    predictor.train_model(epochs=epochs)
+
+    # Calculate next price prediction before showing the plot
+    next_price = predictor.predict_next()
+    predictor.evaluate_model(next_price=next_price)
+
+    print(f"\n📈 Next closing price prediction for {ticker}: {next_price:.2f} $")
